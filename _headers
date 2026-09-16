@@ -1,0 +1,22 @@
+# Static assets — safe to cache aggressively (no password injection)
+/js/*
+  Cache-Control: public, max-age=86400, stale-while-revalidate=604800
+
+/css/*
+  Cache-Control: public, max-age=86400, stale-while-revalidate=604800
+
+/libs/*
+  Cache-Control: public, max-age=604800, immutable
+
+/manifest.json
+  Cache-Control: public, max-age=86400
+
+/service-worker.js
+  Cache-Control: public, max-age=0, must-revalidate
+
+# HTML is transformed by _middleware.js for PASSWORD injection — keep dynamic
+/*.html
+  Cache-Control: public, max-age=0, must-revalidate
+
+/
+  Cache-Control: public, max-age=0, must-revalidate

@@ -131,6 +131,9 @@ const API_SITES = {
     },
 };
 
+// 首次加载默认选中的 API 源（可在设置中随时增删；仅 2 个较快源以缩短首搜延迟）
+const DEFAULT_SELECTED_APIS = ['heimuer', 'jisu'];
+
 // 添加聚合搜索的配置选项
 const AGGREGATED_SEARCH_CONFIG = {
     enabled: true,             // 是否启用聚合搜索

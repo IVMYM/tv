@@ -2,11 +2,14 @@
 
 // --- 配置 (现在从 Cloudflare 环境变量读取) ---
 // 在 Cloudflare Pages 设置 -> 函数 -> 环境变量绑定 中设置以下变量:
-// CACHE_TTL (例如 86400)
+// CACHE_TTL (例如 86400) — 通用回退 TTL
+// API_JSON_CACHE_TTL (例如 600) — 搜索/列表 JSON，默认 10 分钟
+// M3U8_CACHE_TTL (例如 3600) — M3U8 播放列表，默认 1 小时
+// HTML_CACHE_TTL (例如 900) — 详情页 HTML，默认 15 分钟
 // MAX_RECURSION (例如 5)
-// FILTER_DISCONTINUITY (不再需要，设为 false 或移除)
 // USER_AGENTS_JSON (例如 ["UA1", "UA2"]) - JSON 字符串数组
 // DEBUG (例如 false 或 true)
+// LIBRETV_PROXY_KV (可选 KV 绑定，Edge Cache 已可独立工作)
 // --- 配置结束 ---
 
 // --- 常量 (之前在 config.js 中，现在移到这里，因为它们与代理逻辑相关) ---
@@ -30,6 +33,9 @@ export async function onRequest(context) {
     // --- 从环境变量读取配置 ---
     const DEBUG_ENABLED = (env.DEBUG === 'true');
     const CACHE_TTL = parseInt(env.CACHE_TTL || '86400'); // 默认 24 小时
+    const API_JSON_CACHE_TTL = parseInt(env.API_JSON_CACHE_TTL || '600'); // 搜索/列表 JSON，默认 10 分钟
+    const M3U8_CACHE_TTL = parseInt(env.M3U8_CACHE_TTL || '3600'); // M3U8 播放列表，默认 1 小时
+    const HTML_CACHE_TTL = parseInt(env.HTML_CACHE_TTL || '900'); // 详情页 HTML，默认 15 分钟
     const MAX_RECURSION = parseInt(env.MAX_RECURSION || '5'); // 默认 5 层
     // 广告过滤已移至播放器处理，代理不再执行
     let USER_AGENTS = [ // 提供一个基础的默认值
@@ -59,6 +65,53 @@ export async function onRequest(context) {
         if (DEBUG_ENABLED) {
             console.log(`[Proxy Func] ${message}`);
         }
+    }
+
+    function isCacheableMethod(method) {
+        return method === 'GET' || method === 'HEAD';
+    }
+
+    function isVodApiUrl(url) {
+        return /\/api\.php\/provide\/vod\//i.test(url);
+    }
+
+    function isVodDetailHtml(url) {
+        return /\/(index\.php\/)?vod\/detail\//i.test(url);
+    }
+
+    function resolveCacheTtl(targetUrl, contentType, isM3u8) {
+        if (isM3u8) return M3U8_CACHE_TTL;
+        if (isVodApiUrl(targetUrl) || (contentType && contentType.includes('application/json'))) {
+            return API_JSON_CACHE_TTL;
+        }
+        if (isVodDetailHtml(targetUrl) || (contentType && contentType.includes('text/html'))) {
+            return HTML_CACHE_TTL;
+        }
+        return CACHE_TTL;
+    }
+
+    function buildCacheControlHeader(ttl) {
+        return `public, max-age=${ttl}, s-maxage=${ttl}, stale-while-revalidate=60`;
+    }
+
+    async function getCachedProxyResponse() {
+        if (!isCacheableMethod(request.method)) return null;
+        try {
+            const cached = await caches.default.match(request);
+            if (!cached) return null;
+            logDebug(`[Edge Cache 命中] ${request.url}`);
+            const response = new Response(cached.body, cached);
+            response.headers.set('X-Proxy-Cache', 'HIT');
+            return response;
+        } catch (error) {
+            logDebug(`Edge Cache 读取失败: ${error.message}`);
+            return null;
+        }
+    }
+
+    function storeInEdgeCache(response) {
+        if (!isCacheableMethod(request.method) || response.status !== 200) return;
+        waitUntil(caches.default.put(request, response.clone()));
     }
 
     // 从请求路径中提取目标 URL
@@ -111,11 +164,14 @@ export async function onRequest(context) {
     }
 
     // 创建 M3U8 类型的响应
-    function createM3u8Response(content) {
-        return createResponse(content, 200, {
-            "Content-Type": "application/vnd.apple.mpegurl", // M3U8 的标准 MIME 类型
-            "Cache-Control": `public, max-age=${CACHE_TTL}` // 允许浏览器和CDN缓存
+    function createM3u8Response(content, cacheTtl = M3U8_CACHE_TTL) {
+        const response = createResponse(content, 200, {
+            "Content-Type": "application/vnd.apple.mpegurl",
+            "Cache-Control": buildCacheControlHeader(cacheTtl),
+            "X-Proxy-Cache": "MISS"
         });
+        storeInEdgeCache(response);
+        return response;
     }
 
     // 获取随机 User-Agent
@@ -425,6 +481,12 @@ export async function onRequest(context) {
 
         logDebug(`收到代理请求: ${targetUrl}`);
 
+        // --- Edge Cache 检查 (Cache API，无需 KV 绑定) ---
+        const edgeCached = await getCachedProxyResponse();
+        if (edgeCached) {
+            return edgeCached;
+        }
+
         // --- 缓存检查 (KV) ---
         const cacheKey = `proxy_raw:${targetUrl}`; // 使用原始内容的缓存键
         let kvNamespace = null;
@@ -450,10 +512,16 @@ export async function onRequest(context) {
                     if (isM3u8Content(content, contentType)) {
                         logDebug(`缓存内容是 M3U8，重新处理: ${targetUrl}`);
                         const processedM3u8 = await processM3u8Content(targetUrl, content, 0, env);
-                        return createM3u8Response(processedM3u8);
+                        return createM3u8Response(processedM3u8, resolveCacheTtl(targetUrl, contentType, true));
                     } else {
                         logDebug(`从缓存返回非 M3U8 内容: ${targetUrl}`);
-                        return createResponse(content, 200, new Headers(headers));
+                        const ttl = resolveCacheTtl(targetUrl, contentType, false);
+                        const kvHeaders = new Headers(headers);
+                        kvHeaders.set('Cache-Control', buildCacheControlHeader(ttl));
+                        kvHeaders.set('X-Proxy-Cache', 'MISS');
+                        const kvResponse = createResponse(content, 200, kvHeaders);
+                        storeInEdgeCache(kvResponse);
+                        return kvResponse;
                     }
                 } else {
                      logDebug(`[缓存未命中] 原始内容: ${targetUrl}`);
@@ -486,21 +554,26 @@ export async function onRequest(context) {
         if (isM3u8Content(content, contentType)) {
             logDebug(`内容是 M3U8，开始处理: ${targetUrl}`);
             const processedM3u8 = await processM3u8Content(targetUrl, content, 0, env);
-            return createM3u8Response(processedM3u8);
+            return createM3u8Response(processedM3u8, resolveCacheTtl(targetUrl, contentType, true));
         } else {
             logDebug(`内容不是 M3U8 (类型: ${contentType})，直接返回: ${targetUrl}`);
+            const ttl = resolveCacheTtl(targetUrl, contentType, false);
             const finalHeaders = new Headers(responseHeaders);
-            finalHeaders.set('Cache-Control', `public, max-age=${CACHE_TTL}`);
-            // 添加 CORS 头，确保非 M3U8 内容也能跨域访问（例如图片、字幕文件等）
+            finalHeaders.set('Cache-Control', buildCacheControlHeader(ttl));
+            finalHeaders.set('X-Proxy-Cache', 'MISS');
             finalHeaders.set("Access-Control-Allow-Origin", "*");
             finalHeaders.set("Access-Control-Allow-Methods", "GET, HEAD, POST, OPTIONS");
             finalHeaders.set("Access-Control-Allow-Headers", "*");
-            return createResponse(content, 200, finalHeaders);
+            const finalResponse = createResponse(content, 200, finalHeaders);
+            storeInEdgeCache(finalResponse);
+            return finalResponse;
         }
 
     } catch (error) {
         logDebug(`处理代理请求时发生严重错误: ${error.message} \n ${error.stack}`);
-        return createResponse(`代理处理错误: ${error.message}`, 500);
+        const errorResponse = createResponse(`代理处理错误: ${error.message}`, 500);
+        errorResponse.headers.set('Cache-Control', 'no-store');
+        return errorResponse;
     }
 }
 
